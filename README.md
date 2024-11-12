@@ -12,7 +12,7 @@ custom domain name without a static IP! Written in pure BASH.
 ## Installation
 
 ```bash
-git clone https://github.com/K0p1-Git/cloudflare-ddns-updater.git
+git clone https://github.com/oshalabi/cloudflare-ddns-updater.git
 ```
 
 If you want to read the logs in a separate folder run this command

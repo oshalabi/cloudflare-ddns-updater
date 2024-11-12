@@ -33,6 +33,8 @@ proxy="false"
 static_IPv6_mode="false"
 last_notable_hexes="ffff:ffff"
 log_header_name="DDNS Updater_v6"
+log_file=""               # /var/log/dns/cloudflare-ddns-${record_name}.log
+ip_file="/tmp/current_ipv6"
 
 #############  WEBHOOKS CONFIGURATION  ###############
 # @sitename             - Title of site "Example Site"
@@ -45,25 +47,47 @@ slackchannel=""
 slackuri=""
 discorduri=""
 
+###########################################
+## Function to Log Messages
+###########################################
+log_message() {
+    local message="$1"
+    logger "$log_header_name: $message"
+    if [[ -n "$log_file" ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $log_header_name: $message" >> "$log_file"
+    fi
+}
 
+###########################################
+## Function to Send Notifications
+###########################################
+send_notification() {
+    local message="$1"
+    if [[ -n "$slackuri" ]]; then
+        curl -L -X POST "$slackuri" --data-raw "{\"channel\": \"$slackchannel\", \"text\": \"$message\"}"
+    fi
+    if [[ -n "$discorduri" ]]; then
+        curl -i -H "Accept: application/json" -H "Content-Type:application/json" -X POST \
+            --data-raw "{\"content\": \"$message\"}" "$discorduri"
+    fi
+}
 
 ################################################
-## Make sure we have a valid IPv6 connection
+## Check IPv6 Connection
 ################################################
 if ! { curl -6 -s --head --fail https://ipv6.google.com >/dev/null; }; then
-    logger -s "$log_header_name: Unable to establish a valid IPv6 connection to a known host."
+    log_message "Unable to establish a valid IPv6 connection to a known host."
     exit 1
 fi
 
 ################################################
-## Finding our IPv6 address
+## Find IPv6 Address
 ################################################
-# Regex credits to https://stackoverflow.com/a/17871737
-ipv6_regex="(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))"
+ipv6_regex="(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|...)"
 
 if $static_IPv6_mode; then
     # Test whether 'ip' command is available
-    if { command -v "ip" &>/dev/null; }; then
+    if command -v "ip" &>/dev/null; then
         ip=$(ip -6 -o addr show scope global primary -deprecated | grep -oE "$ipv6_regex" | grep -oE ".*($last_notable_hexes)$")
     else
         # Fall back to 'ifconfig' command
@@ -71,116 +95,105 @@ if $static_IPv6_mode; then
     fi
 else
     # Use external services to discover our system's preferred IPv6 address
-    ip=$(curl -s -6 https://cloudflare.com/cdn-cgi/trace | grep -E '^ip')
+    ip=$(curl -s -6 https://cloudflare.com/cdn-cgi/trace | grep -oP 'ip=\K[0-9a-fA-F:.]+')
     ret=$?
-    if [[ ! $ret == 0 ]]; then # In the case that cloudflare failed to return an ip.
-        # Attempt to get the ip from other websites.
-        ip=$(curl -s -6 https://api64.ipify.org || curl -s -6 https://ipv6.icanhazip.com)
-    else
-        # Extract just the ip from the ip line from cloudflare.
-        ip=$(echo $ip | sed -E "s/^ip=($ipv6_regex)$/\1/")
-    fi
+        if [[ ! $ret == 0 ]]; then # In the case that cloudflare failed to return an ip.
+            # Attempt to get the ip from other websites.
+            ip=$(curl -s -6 https://api64.ipify.org || curl -s -6 https://ipv6.icanhazip.com)
+        else
+            # Extract just the ip from the ip line from cloudflare.
+            ip=$(echo $ip | sed -E "s/^ip=($ipv6_regex)$/\1/")
+        fi
 fi
 
-# Check point: Make sure the collected IPv6 address is valid
-if [[ ! $ip =~ ^$ipv6_regex$ ]]; then
-    logger -s "$log_header_name: Failed to find a valid IPv6 address."
+if [[ ! $ip =~ $ipv6_regex ]]; then
+    log_message "Failed to find a valid IPv6 address."
     exit 1
 fi
+log_message "Retrieved IPv6 Address: $ip"
 
 ################################################
-## Check and set the proper auth header
+## Compare with Stored IP
 ################################################
+if [[ -f "$ip_file" ]]; then
+    old_ip=$(cat "$ip_file")
+else
+    old_ip=""
+fi
+
+if [[ "$ip" == "$old_ip" ]]; then
+    log_message "IPv6 ($ip) has not changed, no update needed."
+    exit 0
+else
+    log_message "IPv6 has changed from $old_ip to $ip. Update needed."
+fi
+
+echo "$ip" > "$ip_file"
+
+################################################
+## Set the proper auth header
+################################################
+auth_header="Authorization: Bearer"
 if [[ "${auth_method}" == "global" ]]; then
     auth_header="X-Auth-Key:"
-else
-    auth_header="Authorization: Bearer"
 fi
 
 ################################################
-## Seek for the AAAA record
+## Fetch the AAAA Record from Cloudflare
 ################################################
-logger "$log_header_name: Check Initiated"
+log_message "Check Initiated for AAAA Record"
 record=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records?type=AAAA&name=$record_name" \
     -H "X-Auth-Email: $auth_email" \
     -H "$auth_header $auth_key" \
     -H "Content-Type: application/json")
 
-################################################
-## Check if the domain has an AAAA record
-################################################
 if [[ $record == *"\"count\":0"* ]]; then
-    logger -s "$log_header_name: Record does not exist, perhaps create one first? (${ip} for ${record_name})"
+    log_message "Record does not exist, perhaps create one first? (${ip} for ${record_name})"
     exit 1
 fi
 
 ################################################
-## Get existing IP
+## Get Existing IPv6 Address from Cloudflare
 ################################################
-old_ip=$(echo "$record" | sed -E 's/.*"content":"'${ipv6_regex}'".*/\1/')
+old_ip_cloudflare=$(echo "$record" | grep -oP '"content":"\K[^"]+')
 
 # Make sure the extracted IPv6 address is valid
-if [[ ! $old_ip =~ ^$ipv6_regex$ ]]; then
-    logger -s "$log_header_name: Unable to extract existing IPv6 address from DNS record."
+if [[ ! $old_ip_cloudflare =~ $ipv6_regex ]]; then
+    log_message "Unable to extract existing IPv6 address from DNS record."
     exit 1
 fi
 
 # Compare if they're the same
-if [[ $ip == $old_ip ]]; then
-    logger "$log_header_name: IP ($ip) for ${record_name} has not changed."
+if [[ $ip == $old_ip_cloudflare ]]; then
+    log_message "IPv6 ($old_ip_cloudflare) for ${record_name} has not changed on Cloudflare."
     exit 0
 fi
 
 ################################################
 ## Set the record identifier from result
 ################################################
-record_identifier=$(echo "$record" | sed -E 's/.*"id":"([A-Za-z0-9_]+)".*/\1/')
+record_identifier=$(echo "$record" | grep -oP '"id":"\K[^"]+')
 
 ################################################
-## Change the IP@Cloudflare using the API
+## Update IPv6 on Cloudflare
 ################################################
 update=$(curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/$record_identifier" \
     -H "X-Auth-Email: $auth_email" \
     -H "$auth_header $auth_key" \
     -H "Content-Type: application/json" \
-    --data "{\"content\":\"$ip\",\"ttl\":$ttl,\"proxied\":$proxy}")
+    --data "{\"content\":\"$ip\",\"ttl\":$ttl,\"proxied\":${proxy}}")
 
 ################################################
-## Report the status
+## Report the Status
 ################################################
-case "$update" in
-*"\"success\":false"*)
-    echo -e "$log_header_name: $ip $record_name DDNS failed for $record_identifier ($ip). DUMPING RESULTS:\n$update" | logger -s
-    if [[ $slackuri != "" ]]; then
-        curl -L -X POST $slackuri \
-            --data-raw "{
-                \"channel\": \"$slackchannel\",
-                \"text\": \"$sitename DDNS Update Failed: $record_name: $record_identifier ($ip).\"
-            }"
-    fi
-    if [[ $discorduri != "" ]]; then
-        curl -i -H "Accept: application/json" -H "Content-Type:application/json" -X POST \
-            --data-raw "{
-                \"content\": \"$sitename DDNS Update Failed: $record_name: $record_identifier ($ip).\"
-            }" $discorduri
-    fi
+if [[ $update == *"\"success\":false"* ]]; then
+    message="$log_header_name: $ip $record_name DDNS update failed for $record_identifier ($ip)"
+    log_message "$message"
+    send_notification "$sitename DDNS Update Failed: $record_name ($ip)."
     exit 1
-    ;;
-*)
-    logger "$log_header_name: $ip $record_name DDNS updated."
-    if [[ $slackuri != "" ]]; then
-        curl -L -X POST $slackuri \
-            --data-raw "{
-                \"channel\": \"$slackchannel\",
-                \"text\": \"$sitename Updated: $record_name's new IPv6 Address is $ip\"
-            }"
-    fi
-    if [[ $discorduri != "" ]]; then
-        curl -i -H "Accept: application/json" -H "Content-Type:application/json" -X POST \
-            --data-raw "{
-                \"content\": \"$sitename Updated: $record_name's new IPv6 Address is $ip\"
-            }" $discorduri
-    fi
+else
+    message="$log_header_name: IPv6 for $record_name updated to $ip."
+    log_message "$message"
+    send_notification "$sitename Updated: $record_name's new IPv6 Address is $ip"
     exit 0
-    ;;
-esac
+fi
